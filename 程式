@@ -1,0 +1,173 @@
+#include <WiFi.h>
+#include <WebServer.h>
+#include <HTTPClient.h>
+#include <ArduinoJson.h>
+#include <Adafruit_GFX.h>
+#include <Adafruit_SH110X.h>
+#include "time.h"
+
+// OLED 設定
+#define i2c_Address 0x3c
+Adafruit_SH1106G display = Adafruit_SH1106G(128, 64, &Wire, -1);
+
+// WiFi 資訊
+const char* ssid = "ttimcc";
+const char* password = "12345678";
+
+// --- 台灣政府 API 設定 ---
+String cwa_key = "CWA-D729C38A-6520-49F0-A196-0CB7B296A845"; 
+String moenv_key = "290d8402-2359-4eec-a7ed-4e34657e2c80";
+String my_city = "臺南市"; 
+String my_station = "安南"; 
+
+// 時間伺服器設定
+const char* ntpServer = "pool.ntp.org";
+const long  gmtOffset_sec = 28800; 
+const int   daylightOffset_sec = 0;
+
+WebServer server(80);
+unsigned long lastUpdateTime = 0;
+
+// 數據定義 (增加到 6 個選項)
+int pos[3] = {4, 5, 0}; // 預設：現在時間, 今天日期, 溫度
+String dataNames[] = {"溫度", "風速", "空氣品質", "濕度", "現在時間", "今天日期"};
+String dataValues[] = {"-- C", "-- m/s", "--", "-- %", "00:00:00", "2025/01/01"};
+
+// 1. 抓取氣象署數據
+void fetchCWAData() {
+  if (WiFi.status() == WL_CONNECTED) {
+    HTTPClient http;
+    String url = "https://opendata.cwa.gov.tw/api/v1/rest/datastore/O-A0003-001?Authorization=" + cwa_key + "&format=JSON&StationName=" + my_station;
+    http.begin(url);
+    if (http.GET() == 200) {
+      DynamicJsonDocument doc(4096);
+      deserializeJson(doc, http.getString());
+      JsonObject weatherData = doc["records"]["Station"][0]["WeatherElement"];
+      dataValues[0] = weatherData["AirTemperature"].as<String>() + " C";
+      dataValues[1] = weatherData["WindSpeed"].as<String>() + " m/s";
+      dataValues[3] = weatherData["RelativeHumidity"].as<String>() + " %";
+    }
+    http.end();
+  }
+}
+
+// 2. 抓取環境部 AQI (修正亂碼：轉換為英文)
+void fetchAQIData() {
+  if (WiFi.status() == WL_CONNECTED) {
+    HTTPClient http;
+    // 使用 aqx_p_48 是最穩定的即時 AQI 來源
+    String url = "http://data.moenv.gov.tw/api/v2/aqx_p_48?language=zh&api_key=" + moenv_key + "&limit=100";
+    http.begin(url);
+    if (http.GET() == 200) {
+      DynamicJsonDocument doc(16384);
+      deserializeJson(doc, http.getString());
+      JsonArray records = doc["records"];
+      for (JsonObject record : records) {
+        if (record["sitename"] == my_station) {
+          String aqi = record["aqi"].as<String>();
+          String status = record["status"].as<String>();
+          
+          // --- 解決亂碼：對應表 ---
+          String engStatus = "OK";
+          if (status == "良好") engStatus = "Good";
+          else if (status == "普通") engStatus = "Fair";
+          else if (status == "對敏感族群不健康") engStatus = "M.Bad";
+          else if (status == "對所有族群不健康") engStatus = "Bad";
+          else if (status == "非常不健康") engStatus = "V.Bad";
+          else if (status == "危害") engStatus = "Hazard";
+
+          dataValues[2] = aqi + " " + engStatus;
+          break;
+        }
+      }
+    }
+    http.end();
+  }
+}
+
+void updateLocalTime() {
+  struct tm timeinfo;
+  if(getLocalTime(&timeinfo)){
+    char bufT[10];
+    char bufD[15];
+    strftime(bufT, sizeof(bufT), "%H:%M:%S", &timeinfo);
+    strftime(bufD, sizeof(bufD), "%Y/%m/%d", &timeinfo);
+    dataValues[4] = String(bufT);
+    dataValues[5] = String(bufD);
+  }
+}
+
+// 網頁 HTML
+void handleRoot() {
+  updateLocalTime();
+  String html = "<html><head><meta charset='UTF-8'><meta name='viewport' content='width=device-width, initial-scale=1.0'><style>";
+  html += "body{font-family:sans-serif; background:#f0f0f0; display:flex; flex-direction:column; align-items:center;}";
+  html += ".card{background:white; padding:20px; border-radius:10px; width:320px; box-shadow:0 2px 10px rgba(0,0,0,0.1); margin-top:20px;}";
+  html += "select{width:100%; padding:10px; margin:10px 0; border-radius:5px;}";
+  html += "</style><script>";
+  html += "function validate(){ let s=[document.getElementById('p0'),document.getElementById('p1'),document.getElementById('p2')]; s.forEach((sel,i)=>{for(let opt of sel.options){opt.disabled=false; s.forEach((other,j)=>{if(i!==j && other.value===opt.value)opt.disabled=true;});}}); }";
+  html += "</script></head><body onload='validate()'>";
+  html += "<div class='card'><h2>氣象控制台</h2>";
+  html += "<p style='color:blue;'>📍 測站: " + my_station + "</p>";
+  html += "<form action='/update'>";
+  for(int i=0; i<3; i++){
+    html += "位置 "+String(i+1)+": <select name='p"+String(i)+"' id='p"+String(i)+"' onchange='validate()'>";
+    for(int j=0; j<6; j++) html += "<option value='"+String(j)+"'"+(pos[i]==j?" selected":"")+">"+dataNames[j]+"</option>";
+    html += "</select><br>";
+  }
+  html += "<input type='submit' value='套用排版' style='width:100%; padding:12px; background:#007bff; color:white; border:none; border-radius:5px;'></form></div>";
+  html += "</body></html>";
+  server.send(200, "text/html", html);
+}
+
+void handleUpdate() {
+  for(int i=0; i<3; i++) { if(server.hasArg("p"+String(i))) pos[i] = server.arg("p"+String(i)).toInt(); }
+  server.sendHeader("Location", "/");
+  server.send(303);
+}
+
+void setup() {
+  Serial.begin(115200);
+  display.begin(i2c_Address, true);
+  display.clearDisplay();
+  display.setTextColor(SH110X_WHITE);
+
+  WiFi.begin(ssid, password);
+  while (WiFi.status() != WL_CONNECTED) { delay(500); }
+  
+  configTime(gmtOffset_sec, daylightOffset_sec, ntpServer);
+  
+  fetchCWAData(); 
+  fetchAQIData();
+  
+  server.on("/", handleRoot);
+  server.on("/update", handleUpdate);
+  server.begin();
+}
+
+void loop() {
+  server.handleClient();
+  updateLocalTime();
+
+  if (millis() - lastUpdateTime > 600000) {
+    fetchCWAData();
+    fetchAQIData();
+    lastUpdateTime = millis();
+  }
+
+  display.clearDisplay();
+  // OLED 顯示邏輯
+  display.setTextSize(2); 
+  display.setCursor(0, 2); 
+  display.print(dataValues[pos[0]]); // 第一行大字
+
+  display.setTextSize(1); 
+  display.setCursor(0, 32); 
+  display.print(dataValues[pos[1]]); // 第二行
+
+  display.setCursor(0, 50); 
+  display.print(dataValues[pos[2]]); // 第三行
+  
+  display.display();
+  delay(500);
+}
